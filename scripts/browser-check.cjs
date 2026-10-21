@@ -1,0 +1,146 @@
+// Development QA only. The application itself needs no npm packages.
+const { chromium } = require('playwright');
+const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+const assert = require('node:assert/strict');
+const { randomUUID } = require('node:crypto');
+const root = path.resolve(__dirname, '..');
+const output = path.join(root, 'output', 'web-qa');
+const temp = path.join(root, 'tmp', 'browser-qa', randomUUID());
+fs.mkdirSync(output, { recursive: true });
+fs.mkdirSync(temp, { recursive: true });
+const server = spawn(process.env.CONTEXT_PYTHON || 'python', ['-B','-X','utf8','-u',path.join(root,'webapp.py'),'--port','0','--data',path.join(temp,'runs')], {
+  cwd:root, windowsHide:true, env:{...process.env,OPENAI_API_KEY:'',OPENAI_MODEL:''}, stdio:['ignore','pipe','pipe']
+});
+let log='',browser;
+const checks={}, errors=[];
+server.stderr.on('data', chunk => {log += chunk;});
+const address=new Promise((resolve,reject)=>{
+  const timeout=setTimeout(()=>reject(Error('Server did not start: '+log)),15000);
+  server.stdout.on('data',chunk=>{log+=chunk;const match=log.match(/running at (http:\/\/127\.0\.0\.1:\d+)/);if(match){clearTimeout(timeout);resolve(match[1]);}});
+  server.once('error',reject);server.once('exit',code=>{clearTimeout(timeout);reject(Error('Server exited '+code+' '+log));});
+});
+(async()=>{
+  const url=await address;
+  const executable=process.env.CONTEXT_BROWSER_PATH||['C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe','C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'].find(fs.existsSync);
+  browser=await chromium.launch({headless:true,executablePath:executable,args:['--no-first-run']});
+  const page=await browser.newPage({viewport:{width:1440,height:1050},deviceScaleFactor:1});
+  page.on('pageerror',error=>errors.push(String(error)));
+  await page.goto(url,{waitUntil:'networkidle'});
+  await page.waitForFunction(()=>document.getElementById('connection').textContent.includes('đã kết nối'));
+  assert(await page.locator('#runAll').isEnabled());
+  assert(await page.locator('#withApi').isDisabled());
+  checks.initial_page_and_honest_offline_mode=true;
+  await page.evaluate(()=>window.scrollTo(0,0));
+  await page.screenshot({path:path.join(output,'01-overview-ready.png'),fullPage:true});
+
+  await page.locator('#runAll').click();
+  await page.waitForFunction(()=>document.getElementById('runStatus').textContent==='Kiểm chứng hoàn tất',{},{timeout:30000});
+  assert((await page.locator('#summaryMetrics').innerText()).includes('97,047'));
+  assert((await page.locator('#summaryMetrics').innerText()).includes('99,952'));
+  assert.equal(await page.locator('.accept-item.pass').count(),4);
+  assert((await page.locator('#eventCount').innerText()).includes('bước'));
+  checks.run_all_executes_real_engines_and_checks=true;
+  await page.evaluate(()=>window.scrollTo(0,0));
+  await page.screenshot({path:path.join(output,'02-overview-completed.png'),fullPage:true});
+  const selected=await page.locator('#runId').innerText();
+  const run=await page.evaluate(async id=>(await fetch('/api/runs/'+id)).json(),selected);
+  assert(run.result.passed&&run.result.b1.checks.new_process&&run.result.b2.checks.raw_marker_absent);
+  assert(!JSON.stringify(run).includes('RAW_B1_CANARY')&&!JSON.stringify(run).includes('RAW_B2_CANARY'));
+  checks.managed_result_has_no_raw_log_canary=true;
+
+  await page.locator('.nav-item[data-tab="b1"]').click();
+  assert((await page.locator('#b1Content').innerText()).includes('increase_token_ttl'));
+  assert((await page.locator('#b1Content').innerText()).includes('increase_retry_count'));
+  await page.locator('[data-code="b1:tests_before"]').click();
+  assert((await page.locator('#b1Code').innerText()).includes('FAILED (failures=1)'));
+  await page.locator('[data-code="b1:tests_after"]').click();
+  assert((await page.locator('#b1Code').innerText()).includes('Ran 4 tests'));
+  await page.locator('[data-code="b1:request"]').click();
+  const context1=JSON.parse(await page.locator('#b1Code').innerText());
+  assert.equal(context1.input.length,2);
+  assert(!JSON.stringify(context1).includes('RAW_B1_CANARY'));
+  checks.b1_checkpoint_failed_attempts_test_red_green_and_actual_context=true;
+  await page.evaluate(()=>window.scrollTo(0,0));
+  await page.screenshot({path:path.join(output,'03-b1-request.png'),fullPage:true});
+
+  await page.locator('.nav-item[data-tab="b2"]').click();
+  assert.equal(await page.locator('#b2Content tbody tr').count(),3);
+  assert((await page.locator('#b2Content tbody').innerText()).includes('480'));
+  await page.locator('[data-code="b2:code"]').click();
+  assert((await page.locator('#b2Code').innerText()).includes('tools.read_lines'));
+  await page.locator('[data-code="b2:request"]').click();
+  const context2=JSON.parse(await page.locator('#b2Code').innerText());
+  assert(JSON.parse(context2.input[0].content).LOG_FINDINGS_JSON);
+  assert(!JSON.stringify(context2).includes('RAW_B2_CANARY'));
+  checks.b2_multi_file_answer_program_and_actual_context=true;
+  await page.evaluate(()=>window.scrollTo(0,0));
+  await page.screenshot({path:path.join(output,'04-b2-results.png'),fullPage:true});
+  await page.locator('.evidence-button').first().click();
+  await page.locator('#inspector').waitFor({state:'visible'});
+  assert((await page.locator('#dialogContent').innerText()).includes('RAW_B2_CANARY'));
+  assert((await page.locator('#dialogNote').innerText()).includes('KHÔNG thuộc managed context'));
+  await page.keyboard.press('Escape');
+  checks.raw_sample_is_explicitly_outside_agent_context=true;
+
+  await page.locator('.nav-item[data-tab="evidence"]').click();
+  const jsonDownload=page.waitForEvent('download');
+  await page.locator('#downloadJson').click();
+  const jsonFile=await jsonDownload;await jsonFile.saveAs(path.join(output,'browser-verification.json'));
+  assert(JSON.parse(fs.readFileSync(path.join(output,'browser-verification.json'),'utf8')).passed);
+  const zipDownload=page.waitForEvent('download');
+  await page.locator('#downloadZip').click();
+  const zip=await zipDownload;await zip.saveAs(path.join(output,'browser-evidence.zip'));
+  assert(fs.statSync(path.join(output,'browser-evidence.zip')).size>1000);
+  checks.json_and_zip_evidence_downloads=true;
+  await page.evaluate(()=>window.scrollTo(0,0));
+  await page.screenshot({path:path.join(output,'05-evidence.png'),fullPage:true});
+  await page.reload({waitUntil:'networkidle'});
+  await page.waitForFunction(id=>document.getElementById('runId').textContent===id,selected);
+  assert((await page.locator('#runStatus').innerText()).includes('hoàn tất'));
+  checks.reload_preserves_completed_run=true;
+
+  await page.locator('.nav-item[data-tab="b1"]').click();
+  await page.locator('#b1Content [data-run="b1"]').click();
+  await page.waitForFunction(old=>document.getElementById('runId').textContent!==old&&document.getElementById('runStatus').textContent==='Kiểm chứng hoàn tất',selected,{timeout:30000});
+  const b1id=await page.locator('#runId').innerText();
+  assert.notEqual(b1id,selected);
+  checks.b1_can_run_independently_with_new_evidence=true;
+  await page.locator('.nav-item[data-tab="b2"]').click();
+  await page.locator('#b2Content [data-run="b2"]').click();
+  await page.waitForFunction(old=>document.getElementById('runId').textContent!==old&&document.getElementById('runStatus').textContent==='Kiểm chứng hoàn tất',b1id,{timeout:30000});
+  checks.b2_can_run_independently_with_new_evidence=true;
+  await page.locator(`.history-item[data-select="${selected}"]`).click();
+  await page.waitForFunction(id=>document.getElementById('runId').textContent===id,selected);
+  checks.history_can_switch_between_runs=true;
+
+  await page.setViewportSize({width:390,height:844});
+  await page.locator('.nav-item[data-tab="overview"]').click();
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  await page.evaluate(()=>window.scrollTo(0,0));
+  await page.screenshot({path:path.join(output,'06-mobile-overview.png'),fullPage:true});
+  await page.locator('.nav-item[data-tab="b2"]').click();
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  await page.evaluate(()=>window.scrollTo(0,0));
+  await page.screenshot({path:path.join(output,'07-mobile-b2.png'),fullPage:true});
+  await page.locator('.nav-item[data-tab="evidence"]').click();
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  checks.mobile_panels_have_no_page_overflow=true;
+
+  await page.setViewportSize({width:1440,height:1050});
+  await page.locator('.nav-item[data-tab="overview"]').click();
+  await page.route('**/api/runs',route=>route.request().method()==='POST'?route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'Kiểm tra hiển thị: demo đang bận.'})}):route.continue());
+  await page.locator('#runAll').click();
+  await page.locator('#notice').waitFor({state:'visible'});
+  assert((await page.locator('#notice').innerText()).includes('đang bận'));
+  assert(await page.locator('#runAll').isEnabled());
+  await page.unroute('**/api/runs');
+  checks.failed_start_shows_message_and_reenables_run=true;
+  assert.equal(errors.length,0,errors.join('\n'));
+  checks.no_browser_javascript_errors=true;
+  fs.writeFileSync(path.join(output,'verification.json'),JSON.stringify({passed:true,checks,screenshots:7,real_llm_called:false,tested_at:new Date().toISOString(),run_id:selected,note:'Isolated QA server/data. All B1/B2 executions are real; busy-error UX check uses an intercepted HTTP 409.'},null,2));
+  console.log('PASS: '+Object.keys(checks).length+' browser checks. Evidence: '+output);
+})().catch(error=>{console.error(error);fs.writeFileSync(path.join(output,'failure.txt'),String(error.stack||error));process.exitCode=1;}).finally(async()=>{
+  if(browser)await browser.close();server.kill();fs.writeFileSync(path.join(output,'server.log'),log);
+});
